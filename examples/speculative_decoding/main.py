@@ -59,6 +59,7 @@ from modelopt.recipe.config import (
 )
 from modelopt.torch.opt.conversion import ModeloptStateManager, modelopt_state
 from modelopt.torch.speculative.config import ExternalDraftConfig
+from modelopt.torch.speculative.external.vocab_swap import swap_draft_vocabulary
 from modelopt.torch.speculative.plugins.hf_dflash import HFDFlashModel
 from modelopt.torch.speculative.plugins.hf_domino import DominoLambdaCallback
 from modelopt.torch.speculative.plugins.hf_external import SPARSE_CAPABLE_LOSSES
@@ -177,7 +178,13 @@ def _is_hf_format_checkpoint(checkpoint: str | None) -> bool:
 
 
 def setup_external_draft(
-    recipe, training_args, base_model, draft=None, dry_run=False, base_tokenizer=None
+    recipe,
+    training_args,
+    base_model,
+    draft=None,
+    dry_run=False,
+    base_tokenizer=None,
+    draft_is_resumed=False,
 ):
     """Convert an external draft and wire it to the base model.
 
@@ -199,6 +206,8 @@ def setup_external_draft(
             ``data.data_path`` check in :func:`train` does.
         base_tokenizer: the base's tokenizer when the caller already loaded it; the fresh
             path has it, the resume path does not and leaves this None.
+        draft_is_resumed: the draft came from a checkpoint this mode already converted,
+            so any vocabulary swap it needed has been applied and baked into its weights.
     """
     if recipe.draft_model_name_or_path is None:
         raise ValueError(
@@ -232,12 +241,52 @@ def setup_external_draft(
             trust_remote_code=recipe.model.trust_remote_code,
         )
     external_cfg: dict = recipe.external.model_dump()
-    # The draft's own tokenizer; the base's is used only for its lm_head.
+    # The draft's own tokenizer, needed before conversion if its vocabulary has to be
+    # re-indexed onto the base's.
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         recipe.draft_model_name_or_path,
         model_max_length=training_args.training_seq_len,
         trust_remote_code=recipe.model.trust_remote_code,
     )
+    # Gate on the flag alone, not on a size difference: different tokenizers are
+    # routinely padded to the same width, and that is exactly the case the swap exists
+    # for. Must precede convert so the saved ModelOpt state describes the post-swap
+    # architecture. The rewrite itself is skipped on a resume: such a checkpoint already
+    # has base-indexed rows, while the tokenizer loaded above is still the original
+    # draft's, so swapping again would permute trained rows through a mapping that no
+    # longer applies and re-draw every id that tokenizer could not spell. Both
+    # validations below would still pass -- sizes match and both tokenizers are the
+    # base's by then -- so the run would resume from scrambled embeddings against a
+    # plausible loss curve.
+    if base_tokenizer is None:
+        base_tokenizer = transformers.AutoTokenizer.from_pretrained(
+            recipe.model.model_name_or_path,
+            model_max_length=training_args.training_seq_len,
+            trust_remote_code=recipe.model.trust_remote_code,
+        )
+    if external_cfg["external_vocab_swap"]:
+        # Skip the rewrite only for a draft that carries base-indexed rows already.
+        # Keying on draft_is_resumed alone trusts the flag rather than the checkpoint:
+        # turning the swap on while resuming a run that did not use it would skip the
+        # rewrite and still train against the base tokenizer, and the checks below
+        # cannot catch that -- the tokenizer check compares the base against itself
+        # once tokenizer is reassigned, leaving only the vocabulary size, which is
+        # exactly what coincides in the case this option exists for.
+        already_swapped = draft.get_input_embeddings().weight.shape[0] == base_vocab_size
+        if draft_is_resumed and already_swapped:
+            print_rank_0(
+                "[external] resuming an already-swapped draft; keeping its embeddings as saved"
+            )
+        else:
+            stats = swap_draft_vocabulary(draft, tokenizer, base_tokenizer, base_vocab_size)
+            print_rank_0(
+                f"[external] vocabulary swapped onto the base: "
+                f"{stats['matched']}/{stats['total']} rows carried over, "
+                f"{stats['frequent_coverage']:.1%} of the first 50k ids"
+            )
+        # The draft's rows are indexed by the base vocabulary from here on, so train and
+        # validate it against the base tokenizer.
+        tokenizer = base_tokenizer
     # Sparse data carries only the teacher's truncated policy. Objectives that need full
     # teacher logits would silently train against a zero-padded distribution, so gate on
     # the list the plugin exports.
@@ -270,11 +319,6 @@ def setup_external_draft(
     # with no acceptance. Equal sizes are not enough -- different tokenizers are
     # routinely padded to the same width -- so also check that the two agree on the ids.
     draft.validate_against_base(base_vocab_size)
-    if base_tokenizer is None:
-        base_tokenizer = transformers.AutoTokenizer.from_pretrained(
-            recipe.model.model_name_or_path,
-            trust_remote_code=recipe.model.trust_remote_code,
-        )
     draft.validate_tokenizer_against_base(tokenizer, base_tokenizer)
     # The norm is not always at base_model.model.norm -- FakeBaseModel keeps it at .norm
     # -- so search the same paths the other offline modes use. It stays optional;
@@ -384,7 +428,12 @@ def train():
                 config_overrides=recipe.model.config_overrides,
             )
             model, tokenizer = setup_external_draft(
-                recipe, training_args, base_model=base_model, draft=model, dry_run=dry_run
+                recipe,
+                training_args,
+                base_model=base_model,
+                draft=model,
+                dry_run=dry_run,
+                draft_is_resumed=True,
             )
     else:
         if checkpoint:
